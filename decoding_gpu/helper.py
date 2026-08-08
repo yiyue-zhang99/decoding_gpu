@@ -43,6 +43,11 @@ def make_sliding_features(
     if eligible.size == 0:
         raise ValueError("No samples fall inside the requested time range")
 
+    # Timepoint decoding means exactly one feature vector per original sample.
+    # It must not inherit the temporal stride used by sliding-window decoding.
+    if mode == "timepoint":
+        return np.asarray(data[:, :, eligible]), time[eligible]
+
     requested = np.arange(
         time[eligible[0]],
         time[eligible[-1]] + config.step_ms / 2000,
@@ -50,8 +55,6 @@ def make_sliding_features(
     ) #每次间隔step_ms取点1
     indices = np.array([np.argmin(np.abs(time - value)) for value in requested]) #找出切片点所在的
     indices = np.unique(indices) #decoding过后保留的时间点
-    if mode == "timepoint":
-        return np.asarray(data[:, :, indices]), time[indices]
 
     window_samples = round(config.window_ms * hz / 1000)
     span_samples = round(config.span_ms * hz / 1000)
@@ -141,4 +144,3 @@ def _mahalanobis_batched(
     return distances.reshape(
         time_count, template_count, test_count
     ).permute(1, 2, 0)
-

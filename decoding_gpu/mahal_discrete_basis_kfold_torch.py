@@ -1,12 +1,11 @@
 """GPU discrete-category k-fold Mahalanobis decoding.
 
 For designs with a small number of exact orientation categories (e.g. guven's
-6 cue/uncue item categories) rather than a continuous angle: no kernel
-smoothing or angular bin width is needed, because trials sharing a category
-have bit-identical theta values. Folds are stratified by category, and within
-every fold the training trials used for each template are randomly
-subsampled to the smallest category count, matching
-``mahal_func_theta_kfold_b.m``.
+6 cue/uncue item categories) rather than a continuous angle. Folds are
+stratified by category, and within every fold the training trials used for
+each template are randomly subsampled to the smallest category count. The
+public decoders provide either the resulting hard category means directly or
+convolve them with the reference half-cosine basis before distance estimation.
 """
 
 from __future__ import annotations
@@ -69,6 +68,7 @@ def mahal_discrete_kfold(
     template_angles: torch.Tensor,
     generator: torch.Generator,
     strata: torch.Tensor | None = None,
+    basis_exponent: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode exact discrete angle categories with hard k-fold templates.
 
@@ -93,6 +93,18 @@ def mahal_discrete_kfold(
         device=data.device,
     )
     folds = _stratified_folds(theta.cpu(), n_folds, generator, strata)
+    basis = None
+    if basis_exponent is not None:
+        if basis_exponent <= 0:
+            raise ValueError("basis_exponent must be positive")
+        delta = torch.remainder(
+            template_angles[:, None] - template_angles[None, :] + torch.pi,
+            2 * torch.pi,
+        ) - torch.pi
+        # Exact basis used by mahal_theta_kfold_basis_b.m:
+        # (0.5 + 0.5*cos(theta-mu))^(number of categories - 1).
+        basis = (0.5 + 0.5 * torch.cos(delta)).pow(basis_exponent)
+        basis = basis / basis.sum(dim=1, keepdim=True)
     all_indices = torch.arange(n_trials)
 
     for test_cpu in folds:
@@ -150,7 +162,12 @@ def mahal_discrete_kfold(
                 template_index, selected_cpu.to(data.device)
             ] = 1
         weights = balanced_membership / balanced_count
-        templates = torch.einsum("kn,nft->kft", weights, train_data)
+        hard_templates = torch.einsum("kn,nft->kft", weights, train_data)
+        templates = (
+            hard_templates
+            if basis is None
+            else torch.einsum("kj,jft->kft", basis, hard_templates)
+        )
 
         covariance = _covdiag_batched(train_data.permute(2, 0, 1))
         distances[:, test, :] = _mahalanobis_batched(
@@ -168,7 +185,7 @@ def mahal_discrete_kfold(
     return trial_cos, distances
 
 
-def decode_discrete_repetitions(
+def _decode_discrete_repetitions(
     features: np.ndarray,
     theta: np.ndarray,
     config: DecodeConfig,
@@ -177,8 +194,9 @@ def decode_discrete_repetitions(
     seed: int = 1,
     return_trialwise: bool = False,
     strata: np.ndarray | None = None,
+    basis_exponent: float | None = None,
 ):
-    """Run repeated discrete-category k-fold Mahalanobis decoding."""
+    """Shared repeated hard/basis discrete-category decoder."""
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda" and not torch.cuda.is_available():
@@ -213,6 +231,7 @@ def decode_discrete_repetitions(
             template_angles,
             generator,
             strata_t,
+            basis_exponent,
         )
         trial_sum += trial_cos
         distance_sum += distances.mean(dim=1)
@@ -238,3 +257,58 @@ def decode_discrete_repetitions(
     if return_trialwise:
         return result + (trialwise_np,)
     return result
+
+
+def decode_discrete_repetitions(
+    features: np.ndarray,
+    theta: np.ndarray,
+    config: DecodeConfig,
+    device: str = "auto",
+    dtype: str = "float32",
+    seed: int = 1,
+    return_trialwise: bool = False,
+    strata: np.ndarray | None = None,
+):
+    """Run repeated discrete-category k-fold decoding with hard templates."""
+    return _decode_discrete_repetitions(
+        features,
+        theta,
+        config,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+        return_trialwise=return_trialwise,
+        strata=strata,
+        basis_exponent=None,
+    )
+
+
+def decode_discrete_basis_repetitions(
+    features: np.ndarray,
+    theta: np.ndarray,
+    config: DecodeConfig,
+    basis_exponent: float = 5.0,
+    device: str = "auto",
+    dtype: str = "float32",
+    seed: int = 1,
+    return_trialwise: bool = False,
+    strata: np.ndarray | None = None,
+):
+    """Run repeated discrete k-fold decoding with half-cosine basis templates.
+
+    Training trials are first randomly subsampled so every exact category has
+    the same count. Category means are then convolved with the row-normalised
+    ``(0.5 + 0.5*cos(theta-mu))**basis_exponent`` basis before distances are
+    computed. For Guven's six categories the reference exponent is five.
+    """
+    return _decode_discrete_repetitions(
+        features,
+        theta,
+        config,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+        return_trialwise=return_trialwise,
+        strata=strata,
+        basis_exponent=basis_exponent,
+    )
